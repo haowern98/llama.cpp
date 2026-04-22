@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "chat.h"
 #include "mtmd.h"
+#include "mtmd-helper.h"
 
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
@@ -28,6 +29,11 @@ using json = nlohmann::ordered_json;
 #define SRV_DBG(fmt, ...) LOG_DBG("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 
 using raw_buffer = std::vector<uint8_t>;
+
+struct server_media_input {
+    raw_buffer data;
+    mtmd_helper_media_options options = mtmd_helper_media_options_default();
+};
 
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
@@ -256,7 +262,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files);
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<server_media_input> files);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -305,7 +311,7 @@ json oaicompat_completion_params_parse(const json & body);
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<server_media_input> & out_files);
 
 // convert OpenAI Responses API format to OpenAI Chat Completions API format
 json convert_responses_to_chatcmpl(const json & body);
@@ -314,7 +320,7 @@ json convert_responses_to_chatcmpl(const json & body);
 json convert_transcriptions_to_chatcmpl(
     const json & body,
     const std::map<std::string, raw_buffer> & in_files,
-    std::vector<raw_buffer> & out_files);
+    std::vector<server_media_input> & out_files);
 
 // convert Anthropic Messages API format to OpenAI Chat Completions API format
 json convert_anthropic_to_oai(const json & body);

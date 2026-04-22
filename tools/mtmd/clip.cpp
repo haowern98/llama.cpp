@@ -826,7 +826,8 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 }
 
 static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
-    GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    const bool allow_qwen3vl_batch = ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && imgs.entries.size() > 1;
+    GGML_ASSERT((imgs.entries.size() == 1 || allow_qwen3vl_batch) && "n_batch > 1 is not supported");
 
     const clip_image_f32 & img = *imgs.entries[0];
     std::unique_ptr<clip_graph> builder;
@@ -864,7 +865,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
-                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
+                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img, (int) imgs.entries.size());
             } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
@@ -3042,10 +3043,9 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
 bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec) {
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
+    const bool allow_qwen3vl_batch = ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && !imgs.is_audio && batch_size > 1;
 
-    // TODO @ngxson : implement batch size > 1 as a loop
-    //                we don't need true batching support because the cgraph will gonna be big anyway
-    if (batch_size != 1) {
+    if (batch_size != 1 && !allow_qwen3vl_batch) {
         return false; // only support batch size of 1
     }
 
@@ -3100,9 +3100,19 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
     // set input pixel values
     if (!imgs.is_audio) {
+        GGML_ASSERT(!imgs.entries.empty());
+        const size_t first_pixels = (size_t) imgs.entries[0]->nx * imgs.entries[0]->ny;
+        GGML_ASSERT(first_pixels > 0);
+        const size_t n_channels = imgs.entries[0]->buf.size() / first_pixels;
+        GGML_ASSERT(n_channels == 3 || n_channels == 6);
+
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img->nx * img->ny * 3;
+            const size_t n_pixels = (size_t) img->nx * img->ny;
+            GGML_ASSERT(n_pixels > 0);
+            GGML_ASSERT(img->nx == image_size_width && img->ny == image_size_height);
+            GGML_ASSERT(img->buf.size() == n_pixels * n_channels);
+            nelem += n_pixels * n_channels;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -3121,16 +3131,15 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             const int nx = imgs.entries[i]->nx;
             const int ny = imgs.entries[i]->ny;
             const int n = nx * ny;
+            GGML_ASSERT(imgs.entries[i]->buf.size() == (size_t) n * n_channels);
 
-            for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
+            float * batch_entry = inp_raw.data() + i * (n_channels * n);
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    const size_t base_src = n_channels * (y * nx + x);
+                    const size_t base_dst = y * nx + x;
+                    for (size_t c = 0; c < n_channels; ++c) {
+                        batch_entry[c * n + base_dst] = imgs.entries[i]->buf[base_src + c];
                     }
                 }
             }
@@ -3577,12 +3586,21 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
-    // sanity check (only support batch size of 1 for now)
-    const int n_tokens_out = embeddings->ne[1];
     const int expected_n_tokens_out = clip_n_output_tokens(ctx, imgs.entries[0].get());
-    if (n_tokens_out != expected_n_tokens_out) {
-        LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
-        GGML_ABORT("Invalid number of output tokens");
+    if (allow_qwen3vl_batch) {
+        const int n_tokens_out = embeddings->ne[1];
+        const int n_batches_out = embeddings->ne[2];
+        if (n_tokens_out != expected_n_tokens_out || n_batches_out != batch_size) {
+            LOG_ERR("%s: expected output (%d tokens, %d batches), got (%d tokens, %d batches)\n",
+                __func__, expected_n_tokens_out, batch_size, n_tokens_out, n_batches_out);
+            GGML_ABORT("Invalid number of output tokens");
+        }
+    } else {
+        const int n_tokens_out = embeddings->ne[1];
+        if (n_tokens_out != expected_n_tokens_out) {
+            LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+            GGML_ABORT("Invalid number of output tokens");
+        }
     }
 
     // copy the embeddings to the location passed by the user
@@ -3593,7 +3611,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
     if (ctx->debug_output_embeddings) {
         const int64_t n_embd = embeddings->ne[0];
-        const int64_t n_tokens = embeddings->ne[1];
+        const int64_t n_tokens = embeddings->ne[1] * std::max<int64_t>(1, embeddings->ne[2]);
         std::vector<float> emb_data(n_embd * n_tokens);
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 

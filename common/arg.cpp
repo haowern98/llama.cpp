@@ -574,6 +574,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
+    if (params.video_fps > 0.0 && params.video_nframes > 0) {
+        throw std::invalid_argument("error: --video-fps and --video-nframes are mutually exclusive\n");
+    }
+    if (params.video_start >= 0.0 && params.video_end >= 0.0 && params.video_start >= params.video_end) {
+        throw std::invalid_argument("error: --video-start must be smaller than --video-end\n");
+    }
 
     // handle model and download
     if (!skip_model_download) {
@@ -2187,6 +2193,57 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--video"}, "FILE",
+        "path to a video file. use with multimodal Qwen models, use comma-separated values for multiple files\n",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                params.video.emplace_back(item);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--video-fps"}, "F",
+        "sampling fps for video input (mutually exclusive with --video-nframes; default: 2.0 when omitted)",
+        [](common_params & params, const std::string & value) {
+            params.video_fps = std::stod(value);
+        }
+    ).set_examples(mmproj_examples));
+    add_opt(common_arg(
+        {"--video-nframes"}, "N",
+        "explicit number of sampled video frames (mutually exclusive with --video-fps)",
+        [](common_params & params, int value) {
+            params.video_nframes = value;
+        }
+    ).set_examples(mmproj_examples));
+    add_opt(common_arg(
+        {"--video-min-frames"}, "N",
+        "minimum sampled frames for fps-based video input",
+        [](common_params & params, int value) {
+            params.video_min_frames = value;
+        }
+    ).set_examples(mmproj_examples));
+    add_opt(common_arg(
+        {"--video-max-frames"}, "N",
+        "maximum sampled frames for fps-based video input",
+        [](common_params & params, int value) {
+            params.video_max_frames = value;
+        }
+    ).set_examples(mmproj_examples));
+    add_opt(common_arg(
+        {"--video-start"}, "SECONDS",
+        "optional start time for video sampling",
+        [](common_params & params, const std::string & value) {
+            params.video_start = std::stod(value);
+        }
+    ).set_examples(mmproj_examples));
+    add_opt(common_arg(
+        {"--video-end"}, "SECONDS",
+        "optional end time for video sampling",
+        [](common_params & params, const std::string & value) {
+            params.video_end = std::stod(value);
+        }
+    ).set_examples(mmproj_examples));
     add_opt(common_arg(
         {"--image-min-tokens"}, "N",
         "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)",

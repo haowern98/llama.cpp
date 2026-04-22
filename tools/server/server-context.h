@@ -128,7 +128,7 @@ private:
             const server_http_req & req,
             server_task_type type,
             const json & data,
-            const std::vector<raw_buffer> & files,
+            const std::vector<server_media_input> & files,
             task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);

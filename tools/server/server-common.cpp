@@ -353,7 +353,9 @@ void server_tokens::push_back(llama_token tok) {
 
 void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     auto type = mtmd_input_chunk_get_type(chunk);
-    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE
+            || type == MTMD_INPUT_CHUNK_TYPE_VIDEO
+            || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         GGML_ASSERT(has_mtmd);
         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
         size_t start_idx = tokens.size();
@@ -539,8 +541,11 @@ int32_t server_tokens::process_chunk(
             int32_t seq_id,
             size_t & n_tokens_out) const {
     const auto & chunk = find_chunk(idx);
-    const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
-                        ? "image" : "audio";
+    const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_AUDIO
+                        ? "audio"
+                        : mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_VIDEO
+                            ? "video"
+                            : "image";
     SRV_INF("processing %s...\n", name);
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
@@ -713,15 +718,31 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
+static std::string hash_media_input(const server_media_input & media) {
+    std::string hash = fnv_hash(media.data.data(), media.data.size());
+    hash += ":" + std::to_string((int) media.options.media_type);
+    hash += ":" + std::to_string(media.options.video_nframes);
+    hash += ":" + std::to_string(media.options.video_min_frames);
+    hash += ":" + std::to_string(media.options.video_max_frames);
+    hash += ":" + std::to_string(media.options.video_fps);
+    hash += ":" + std::to_string(media.options.video_start);
+    hash += ":" + std::to_string(media.options.video_end);
+    return hash;
+}
+
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<server_media_input> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf_ex(
+            mctx,
+            file.data.data(),
+            file.data.size(),
+            &file.options));
         if (!bmp.ptr) {
-            throw std::runtime_error("Failed to load image or audio file");
+            throw std::runtime_error("Failed to load media file");
         }
         // calculate bitmap hash (for KV caching)
-        std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
+        std::string hash = hash_media_input(file);
         bmp.set_id(hash.c_str());
         bitmaps.entries.push_back(std::move(bmp));
     }
@@ -775,9 +796,11 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
                 throw std::runtime_error("Multimodal data provided, but model does not support multimodal requests.");
 
             // JSON object with prompt and multimodal key.
-            std::vector<raw_buffer> files;
+            std::vector<server_media_input> files;
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
-                files.push_back(base64_decode(entry));
+                server_media_input media;
+                media.data = base64_decode(entry);
+                files.push_back(std::move(media));
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
         } else {
@@ -851,58 +874,69 @@ json oaicompat_completion_params_parse(const json & body) {
 
 // media_path always end with '/', see arg.cpp
 static void handle_media(
-        std::vector<raw_buffer> & out_files,
+        std::vector<server_media_input> & out_files,
         json & media_obj,
-        const std::string & media_path) {
+        const std::string & media_path,
+        const mtmd_helper_media_options & options) {
     std::string url = json_value(media_obj, "url", std::string());
     if (string_starts_with(url, "http")) {
-        // download remote image
+        // download remote media
         // TODO @ngxson : maybe make these params configurable
         common_remote_params params;
         params.max_size = 1024 * 1024 * 10; // 10MB
         params.timeout  = 10; // seconds
-        SRV_INF("downloading image from '%s'\n", url.c_str());
+        SRV_INF("downloading media from '%s'\n", url.c_str());
         auto res = common_remote_get_content(url, params);
         if (200 <= res.first && res.first < 300) {
             SRV_INF("downloaded %zu bytes\n", res.second.size());
-            raw_buffer data;
-            data.insert(data.end(), res.second.begin(), res.second.end());
-            out_files.push_back(data);
+            server_media_input media;
+            media.options = options;
+            media.data.insert(media.data.end(), res.second.begin(), res.second.end());
+            out_files.push_back(std::move(media));
         } else {
-            throw std::runtime_error("Failed to download image");
+            throw std::runtime_error("Failed to download media");
         }
 
     } else if (string_starts_with(url, "file://")) {
         if (media_path.empty()) {
             throw std::invalid_argument("file:// URLs are not allowed unless --media-path is specified");
         }
-        // load local image file
+        // load local media file
         std::string file_path = url.substr(7); // remove "file://"
-        raw_buffer data;
         if (!fs_validate_filename(file_path, true)) {
             throw std::invalid_argument("file path is not allowed: " + file_path);
         }
-        SRV_INF("loading image from local file '%s'\n", (media_path + file_path).c_str());
+        SRV_INF("loading media from local file '%s'\n", (media_path + file_path).c_str());
         std::ifstream file(media_path + file_path, std::ios::binary);
         if (!file) {
             throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
         }
-        data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        out_files.push_back(data);
+        server_media_input media;
+        media.options = options;
+        media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        out_files.push_back(std::move(media));
 
     } else {
-        // try to decode base64 image
+        // try to decode base64 media
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
+        std::string expected_prefix = "data:image/";
+        if (options.media_type == MTMD_HELPER_MEDIA_TYPE_VIDEO) {
+            expected_prefix = "data:video/";
+        } else if (options.media_type == MTMD_HELPER_MEDIA_TYPE_AUDIO) {
+            expected_prefix = "data:audio/";
+        }
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid url value");
-        } else if (!string_starts_with(parts[0], "data:image/")) {
+        } else if (!string_starts_with(parts[0], expected_prefix)) {
             throw std::runtime_error("Invalid url format: " + parts[0]);
         } else if (!string_ends_with(parts[0], "base64")) {
             throw std::runtime_error("url must be base64 encoded");
         } else {
             auto base64_data = parts[1];
-            auto decoded_data = base64_decode(base64_data);
-            out_files.push_back(decoded_data);
+            server_media_input media;
+            media.options = options;
+            media.data = base64_decode(base64_data);
+            out_files.push_back(std::move(media));
         }
     }
 }
@@ -911,7 +945,7 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<server_media_input> & out_files)
 {
     json llama_params;
 
@@ -994,11 +1028,30 @@ json oaicompat_chat_params_parse(
                 }
 
                 json image_url = json_value(p, "image_url", json::object());
-                handle_media(out_files, image_url, opt.media_path);
-
-                p["type"] = "media_marker";
+                auto media_options = mtmd_helper_media_options_default();
+                media_options.media_type = MTMD_HELPER_MEDIA_TYPE_IMAGE;
+                handle_media(out_files, image_url, opt.media_path, media_options);
                 p["text"] = get_media_marker();
-                p.erase("image_url");
+
+            } else if (type == "video_url") {
+                if (!opt.allow_image) {
+                    throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                }
+
+                json video_url = json_value(p, "video_url", json::object());
+                auto media_options = mtmd_helper_media_options_default();
+                media_options.media_type = MTMD_HELPER_MEDIA_TYPE_VIDEO;
+                media_options.video_fps = json_value(video_url, "fps", -1.0);
+                media_options.video_nframes = json_value(video_url, "nframes", -1);
+                media_options.video_min_frames = json_value(video_url, "min_frames", -1);
+                media_options.video_max_frames = json_value(video_url, "max_frames", -1);
+                media_options.video_start = json_value(video_url, "video_start", -1.0);
+                media_options.video_end = json_value(video_url, "video_end", -1.0);
+                if (media_options.video_fps > 0.0 && media_options.video_nframes > 0) {
+                    throw std::invalid_argument("video_url accepts either fps or nframes, not both");
+                }
+                handle_media(out_files, video_url, opt.media_path, media_options);
+                p["text"] = get_media_marker();
 
             } else if (type == "input_audio") {
                 if (!opt.allow_audio) {
@@ -1012,14 +1065,14 @@ json oaicompat_chat_params_parse(
                 if (format != "wav" && format != "mp3") {
                     throw std::invalid_argument("input_audio.format must be either 'wav' or 'mp3'");
                 }
-                auto decoded_data = base64_decode(data); // expected to be base64 encoded
-                out_files.push_back(decoded_data);
+                server_media_input media;
+                media.options = mtmd_helper_media_options_default();
+                media.options.media_type = MTMD_HELPER_MEDIA_TYPE_AUDIO;
+                media.data = base64_decode(data); // expected to be base64 encoded
+                out_files.push_back(std::move(media));
 
                 // TODO: add audio_url support by reusing handle_media()
-
-                p["type"] = "media_marker";
                 p["text"] = get_media_marker();
-                p.erase("input_audio");
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");
@@ -1033,7 +1086,19 @@ json oaicompat_chat_params_parse(
     inputs.tool_choice           = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema           = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar               = grammar;
-    inputs.use_jinja             = opt.use_jinja;
+    bool has_typed_media = false;
+    for (const auto & msg : inputs.messages) {
+        for (const auto & part : msg.content_parts) {
+            if (part.type != "text" && part.type != "media_marker") {
+                has_typed_media = true;
+                break;
+            }
+        }
+        if (has_typed_media) {
+            break;
+        }
+    }
+    inputs.use_jinja             = opt.use_jinja || has_typed_media;
     inputs.parallel_tool_calls   = json_value(body, "parallel_tool_calls", false);
     inputs.add_generation_prompt = json_value(body, "add_generation_prompt", true);
     inputs.reasoning_format      = opt.reasoning_format;
@@ -1250,6 +1315,37 @@ json convert_responses_to_chatcmpl(const json & response_body) {
                             }},
                             {"type", "image_url"},
                         });
+                    } else if (type == "input_video") {
+                        if (!input_item.contains("video_url")) {
+                            throw std::invalid_argument("'video_url' is required");
+                        }
+
+                        json video_url = json::object();
+                        video_url["url"] = input_item.at("video_url");
+
+                        if (input_item.contains("fps")) {
+                            video_url["fps"] = input_item.at("fps");
+                        }
+                        if (input_item.contains("nframes")) {
+                            video_url["nframes"] = input_item.at("nframes");
+                        }
+                        if (input_item.contains("min_frames")) {
+                            video_url["min_frames"] = input_item.at("min_frames");
+                        }
+                        if (input_item.contains("max_frames")) {
+                            video_url["max_frames"] = input_item.at("max_frames");
+                        }
+                        if (input_item.contains("video_start")) {
+                            video_url["video_start"] = input_item.at("video_start");
+                        }
+                        if (input_item.contains("video_end")) {
+                            video_url["video_end"] = input_item.at("video_end");
+                        }
+
+                        chatcmpl_content.push_back({
+                            {"video_url", std::move(video_url)},
+                            {"type", "video_url"},
+                        });
                     } else if (type == "input_file") {
                         throw std::invalid_argument("'input_file' is not supported by llamacpp at this moment");
                         // if (input_item.contains("file_url")) {
@@ -1267,7 +1363,7 @@ json convert_responses_to_chatcmpl(const json & response_body) {
                         //     {"type", "file"},
                         // });
                     } else {
-                        throw std::invalid_argument("'type' must be one of 'input_text', 'input_image', or 'input_file'");
+                        throw std::invalid_argument("'type' must be one of 'input_text', 'input_image', 'input_video', or 'input_file'");
                     }
                 }
 
@@ -1458,13 +1554,17 @@ json convert_responses_to_chatcmpl(const json & response_body) {
 json convert_transcriptions_to_chatcmpl(
         const json & inp_body,
         const std::map<std::string, raw_buffer> & in_files,
-        std::vector<raw_buffer> & out_files) {
+        std::vector<server_media_input> & out_files) {
     // TODO @ngxson : this function may need to be improved in the future
     // handle input files
     out_files.clear();
     auto it = in_files.find("file");
     if (it != in_files.end()) {
-        out_files.push_back(it->second);
+        server_media_input media;
+        media.options = mtmd_helper_media_options_default();
+        media.options.media_type = MTMD_HELPER_MEDIA_TYPE_AUDIO;
+        media.data = it->second;
+        out_files.push_back(std::move(media));
     } else {
         throw std::invalid_argument("No input file found for transcription");
     }
@@ -1576,27 +1676,29 @@ json convert_anthropic_to_oai(const json & body) {
                     converted_content.push_back(block);
                 } else if (type == "thinking") {
                     reasoning_content += json_value(block, "thinking", std::string());
-                } else if (type == "image") {
+                } else if (type == "image" || type == "video") {
                     json source = json_value(block, "source", json::object());
                     std::string source_type = json_value(source, "type", std::string());
+                    const bool is_video = type == "video";
+                    const char * content_type = is_video ? "video_url" : "image_url";
 
                     if (source_type == "base64") {
-                        std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
+                        std::string media_type = json_value(source, "media_type", std::string(is_video ? "video/mp4" : "image/jpeg"));
                         std::string data = json_value(source, "data", std::string());
                         std::ostringstream ss;
                         ss << "data:" << media_type << ";base64," << data;
 
                         converted_content.push_back({
-                            {"type", "image_url"},
-                            {"image_url", {
+                            {"type", content_type},
+                            {content_type, {
                                 {"url", ss.str()}
                             }}
                         });
                     } else if (source_type == "url") {
                         std::string url = json_value(source, "url", std::string());
                         converted_content.push_back({
-                            {"type", "image_url"},
-                            {"image_url", {
+                            {"type", content_type},
+                            {content_type, {
                                 {"url", url}
                             }}
                         });

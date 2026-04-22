@@ -9,6 +9,7 @@
 
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd-video.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -180,6 +181,11 @@ struct decode_embd_batch {
         }
     }
 
+    // M-RoPE for video uses temporal / height / width positions.
+    void set_position_mrope_3d(const std::vector<mtmd_decoder_pos> & rel_pos, llama_seq_id seq_id) {
+        set_position_mrope_2d(rel_pos, seq_id);
+    }
+
     // M-RoPE for audio
     void set_position_mrope_1d(llama_pos pos_0, llama_seq_id seq_id) {
         GGML_ASSERT(n_pos_per_embd == 4);
@@ -244,7 +250,8 @@ int32_t mtmd_helper_decode_image_chunk(
         llama_pos * new_n_past) {
     GGML_ASSERT(n_batch > 0);
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
-    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
+    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO ? "audio" :
+                        chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO ? "video" : "image";
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_ERR("failed to decode chunk: input chunk not of image/audio type\n");
         return -1;
@@ -260,7 +267,7 @@ int32_t mtmd_helper_decode_image_chunk(
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     if (mtmd_decode_use_mrope(ctx)) {
-        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
             const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
             if (!image_tokens) {
                 LOG_ERR("failed to decode chunk: image tokens are null\n");
@@ -269,7 +276,23 @@ int32_t mtmd_helper_decode_image_chunk(
             const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
             std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
             mtmd_helper_image_get_decoder_pos(image_tokens, n_past, rel_pos.data());
-            batch_embd.set_position_mrope_2d(rel_pos, seq_id);
+            const auto nt = mtmd_image_tokens_get_nt(image_tokens);
+            if (nt > 1) {
+                batch_embd.set_position_mrope_3d(rel_pos, seq_id);
+            } else {
+                batch_embd.set_position_mrope_2d(rel_pos, seq_id);
+            }
+            const auto slice_count = mtmd_image_tokens_get_video_slice_count(image_tokens);
+            if (slice_count > 0) {
+                LOG_INF(
+                    "%s slice %zu/%zu, frames [%d, %d], t=%.1fs\n",
+                    name,
+                    mtmd_image_tokens_get_video_slice_index(image_tokens) + 1,
+                    slice_count,
+                    mtmd_image_tokens_get_video_frame_start(image_tokens),
+                    mtmd_image_tokens_get_video_frame_end(image_tokens),
+                    mtmd_image_tokens_get_video_timestamp_seconds(image_tokens));
+            }
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);
         } else {
@@ -357,8 +380,11 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
             *new_n_past += text_batch.n_tokens;
         }
 
-    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-        const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
+    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
+            || chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO
+            || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO ? "audio" :
+                            chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO ? "video" : "image";
         int64_t t0 = ggml_time_ms();
 
         LOG_INF("encoding %s slice...\n", name);
@@ -479,7 +505,19 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 } // namespace audio_helpers
 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
-    if (audio_helpers::is_audio_file((const char *)buf, len)) {
+    const mtmd_helper_media_options options = mtmd_helper_media_options_default();
+    return mtmd_helper_bitmap_init_from_buf_ex(ctx, buf, len, &options);
+}
+
+mtmd_bitmap * mtmd_helper_bitmap_init_from_buf_ex(
+        mtmd_context * ctx,
+        const unsigned char * buf,
+        size_t len,
+        const mtmd_helper_media_options * options) {
+    const mtmd_helper_media_options resolved = options ? *options : mtmd_helper_media_options_default();
+
+    if (resolved.media_type == MTMD_HELPER_MEDIA_TYPE_AUDIO
+            || (resolved.media_type == MTMD_HELPER_MEDIA_TYPE_AUTO && audio_helpers::is_audio_file((const char *) buf, len))) {
         std::vector<float> pcmf32;
         const int sample_rate = mtmd_get_audio_sample_rate(ctx);
         if (sample_rate < 0) {
@@ -491,6 +529,20 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
             return nullptr;
         }
         return mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data());
+    }
+
+    if (resolved.media_type == MTMD_HELPER_MEDIA_TYPE_VIDEO
+            || (resolved.media_type == MTMD_HELPER_MEDIA_TYPE_AUTO && mtmd_video_is_video_buffer(buf, len))) {
+        mtmd_bitmap * video = mtmd_video_bitmap_init_from_buf(ctx, buf, len, &resolved);
+        if (!video) {
+            LOG_ERR("%s: failed to decode video bytes\n", __func__);
+        }
+        return video;
+    }
+
+    if (resolved.media_type == MTMD_HELPER_MEDIA_TYPE_AUDIO || resolved.media_type == MTMD_HELPER_MEDIA_TYPE_VIDEO) {
+        LOG_ERR("%s: input buffer is not decodable as requested media type\n", __func__);
+        return nullptr;
     }
 
     // otherwise, we assume it's an image
@@ -509,6 +561,24 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
 }
 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, const char * fname) {
+    const mtmd_helper_media_options options = mtmd_helper_media_options_default();
+    return mtmd_helper_bitmap_init_from_file_ex(ctx, fname, &options);
+}
+
+mtmd_bitmap * mtmd_helper_bitmap_init_from_file_ex(
+        mtmd_context * ctx,
+        const char * fname,
+        const mtmd_helper_media_options * options) {
+    const mtmd_helper_media_options resolved = options ? *options : mtmd_helper_media_options_default();
+
+    if (resolved.media_type == MTMD_HELPER_MEDIA_TYPE_VIDEO) {
+        mtmd_bitmap * video = mtmd_video_bitmap_init_from_file(ctx, fname, &resolved);
+        if (!video) {
+            LOG_ERR("%s: failed to decode video file '%s'\n", __func__, fname);
+        }
+        return video;
+    }
+
     std::vector<unsigned char> buf;
     FILE * f = fopen(fname, "rb");
     if (!f) {
@@ -533,5 +603,11 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, const char *
         return nullptr;
     }
 
-    return mtmd_helper_bitmap_init_from_buf(ctx, buf.data(), buf.size());
+    if (resolved.media_type == MTMD_HELPER_MEDIA_TYPE_AUTO) {
+        if (mtmd_bitmap * video = mtmd_video_bitmap_init_from_file(ctx, fname, &resolved)) {
+            return video;
+        }
+    }
+
+    return mtmd_helper_bitmap_init_from_buf_ex(ctx, buf.data(), buf.size(), &resolved);
 }

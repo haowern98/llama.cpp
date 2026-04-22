@@ -1,14 +1,17 @@
 # mtmd
 
 find_package(Threads REQUIRED)
+option(LLAMA_MTMD_FFMPEG "Enable in-process FFmpeg video decode support in mtmd" OFF)
 
 add_library(mtmd
             mtmd.cpp
             mtmd-audio.cpp
             mtmd-image.cpp
+            mtmd-video.cpp
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper.h
+            mtmd-video.h
             clip.cpp
             clip.h
             clip-impl.h
@@ -54,6 +57,47 @@ target_include_directories(mtmd PUBLIC  .)
 target_include_directories(mtmd PRIVATE ../..)
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
+
+if (LLAMA_MTMD_FFMPEG)
+    find_path(FFMPEG_INCLUDE_DIR
+        NAMES libavcodec/avcodec.h
+        HINTS ENV FFMPEG_ROOT
+        PATH_SUFFIXES include)
+    find_library(FFMPEG_AVFORMAT_LIBRARY
+        NAMES avformat
+        HINTS ENV FFMPEG_ROOT
+        PATH_SUFFIXES lib)
+    find_library(FFMPEG_AVCODEC_LIBRARY
+        NAMES avcodec
+        HINTS ENV FFMPEG_ROOT
+        PATH_SUFFIXES lib)
+    find_library(FFMPEG_AVUTIL_LIBRARY
+        NAMES avutil
+        HINTS ENV FFMPEG_ROOT
+        PATH_SUFFIXES lib)
+    find_library(FFMPEG_SWSCALE_LIBRARY
+        NAMES swscale
+        HINTS ENV FFMPEG_ROOT
+        PATH_SUFFIXES lib)
+
+    if (NOT FFMPEG_INCLUDE_DIR
+            OR NOT FFMPEG_AVFORMAT_LIBRARY
+            OR NOT FFMPEG_AVCODEC_LIBRARY
+            OR NOT FFMPEG_AVUTIL_LIBRARY
+            OR NOT FFMPEG_SWSCALE_LIBRARY)
+        message(FATAL_ERROR
+            "LLAMA_MTMD_FFMPEG=ON but FFmpeg development libraries were not found.\n"
+            "Set FFMPEG_ROOT to the FFmpeg install prefix containing include/ and lib/.")
+    endif()
+
+    target_compile_definitions(mtmd PRIVATE LLAMA_MTMD_FFMPEG)
+    target_include_directories(mtmd PRIVATE ${FFMPEG_INCLUDE_DIR})
+    target_link_libraries(mtmd PRIVATE
+        ${FFMPEG_AVFORMAT_LIBRARY}
+        ${FFMPEG_AVCODEC_LIBRARY}
+        ${FFMPEG_AVUTIL_LIBRARY}
+        ${FFMPEG_SWSCALE_LIBRARY})
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties     (mtmd PROPERTIES POSITION_INDEPENDENT_CODE ON)

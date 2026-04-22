@@ -38,6 +38,15 @@ struct common_chat_tool_call {
 struct common_chat_msg_content_part {
     std::string type;
     std::string text;
+    std::string url;
+    double      video_fps        = -1.0;
+    int         video_nframes    = -1;
+    int         video_min_frames = -1;
+    int         video_max_frames = -1;
+    double      video_start      = -1.0;
+    double      video_end        = -1.0;
+    std::string input_audio_data;
+    std::string input_audio_format;
 
     // TODO @ngxson : no known chat templates support reasoning_content in content parts yet
     //                this can be useful for models with interleaved thinking (like Kimi-K2)
@@ -45,7 +54,11 @@ struct common_chat_msg_content_part {
     // std::string reasoning_content;
 
     bool operator==(const common_chat_msg_content_part & other) const {
-        return type == other.type && text == other.text;
+        return type == other.type && text == other.text && url == other.url &&
+               video_fps == other.video_fps && video_nframes == other.video_nframes &&
+               video_min_frames == other.video_min_frames && video_max_frames == other.video_max_frames &&
+               video_start == other.video_start && video_end == other.video_end &&
+               input_audio_data == other.input_audio_data && input_audio_format == other.input_audio_format;
     }
 };
 

@@ -55,11 +55,12 @@ static void signal_handler(int) {
 struct cli_context {
     server_context ctx_server;
     json messages = json::array();
-    std::vector<raw_buffer> input_files;
+    std::vector<server_media_input> input_files;
     task_params defaults;
     bool verbose_prompt;
     int reasoning_budget = -1;
     std::string reasoning_budget_message;
+    mtmd_helper_media_options video_options = mtmd_helper_media_options_default();
 
     // thread for showing "loading" animation
     std::atomic<bool> loading_show;
@@ -78,6 +79,13 @@ struct cli_context {
         verbose_prompt = params.verbose_prompt;
         reasoning_budget = params.reasoning_budget;
         reasoning_budget_message = params.reasoning_budget_message;
+        video_options.media_type = MTMD_HELPER_MEDIA_TYPE_VIDEO;
+        video_options.video_fps = params.video_fps;
+        video_options.video_nframes = params.video_nframes;
+        video_options.video_min_frames = params.video_min_frames;
+        video_options.video_max_frames = params.video_max_frames;
+        video_options.video_start = params.video_start;
+        video_options.video_end = params.video_end;
     }
 
     std::string generate_completion(result_timings & out_timings) {
@@ -186,15 +194,16 @@ struct cli_context {
     }
 
     // TODO: support remote files in the future (http, https, etc)
-    std::string load_input_file(const std::string & fname, bool is_media) {
+    std::string load_input_file(const std::string & fname, bool is_media, const mtmd_helper_media_options * media_options = nullptr) {
         std::ifstream file(fname, std::ios::binary);
         if (!file) {
             return "";
         }
         if (is_media) {
-            raw_buffer buf;
-            buf.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-            input_files.push_back(std::move(buf));
+            server_media_input media;
+            media.options = media_options ? *media_options : mtmd_helper_media_options_default();
+            media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            input_files.push_back(std::move(media));
             return get_media_marker();
         } else {
             std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -212,7 +221,19 @@ struct cli_context {
         inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
         inputs.json_schema           = ""; // TODO
         inputs.grammar               = ""; // TODO
-        inputs.use_jinja             = chat_params.use_jinja;
+        bool has_typed_media = false;
+        for (const auto & msg : inputs.messages) {
+            for (const auto & part : msg.content_parts) {
+                if (part.type != "text" && part.type != "media_marker") {
+                    has_typed_media = true;
+                    break;
+                }
+            }
+            if (has_typed_media) {
+                break;
+            }
+        }
+        inputs.use_jinja             = chat_params.use_jinja || has_typed_media;
         inputs.parallel_tool_calls   = false;
         inputs.add_generation_prompt = true;
         inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
@@ -225,13 +246,14 @@ struct cli_context {
 };
 
 // TODO?: Make this reusable, enums, docs
-static const std::array<const std::string, 7> cmds = {
+static const std::array<const std::string, 8> cmds = {
     "/audio ",
     "/clear",
     "/exit",
     "/glob ",
     "/image ",
     "/read ",
+    "/video ",
     "/regen",
 };
 
@@ -438,6 +460,7 @@ int main(int argc, char ** argv) {
     console::log("  /glob <pattern>     add text files using globbing pattern\n");
     if (inf.has_inp_image) {
         console::log("  /image <file>       add an image file\n");
+        console::log("  /video <file>       add a video file\n");
     }
     if (inf.has_inp_audio) {
         console::log("  /audio <file>       add an audio file\n");
@@ -446,6 +469,59 @@ int main(int argc, char ** argv) {
 
     // interactive loop
     std::string cur_msg;
+    json cur_content_parts = json::array();
+
+    auto flush_text_part = [&]() {
+        if (cur_msg.empty()) {
+            return;
+        }
+        cur_content_parts.push_back({
+            {"type", "text"},
+            {"text", cur_msg}
+        });
+        cur_msg.clear();
+    };
+
+    auto add_media_part = [&](const std::string & type, const std::string & fname, const std::string & marker,
+                              const mtmd_helper_media_options * media_options = nullptr) {
+        flush_text_part();
+
+        json part = {
+            {"type", type},
+            {"text", marker},
+        };
+
+        if (type == "image_url") {
+            part["image_url"] = {
+                {"url", fname},
+            };
+        } else if (type == "video_url") {
+            json video_url = {
+                {"url", fname},
+            };
+            if (media_options && media_options->video_fps > 0.0) {
+                video_url["fps"] = media_options->video_fps;
+            }
+            if (media_options && media_options->video_nframes > 0) {
+                video_url["nframes"] = media_options->video_nframes;
+            }
+            if (media_options && media_options->video_min_frames > 0) {
+                video_url["min_frames"] = media_options->video_min_frames;
+            }
+            if (media_options && media_options->video_max_frames > 0) {
+                video_url["max_frames"] = media_options->video_max_frames;
+            }
+            if (media_options && media_options->video_start >= 0.0) {
+                video_url["video_start"] = media_options->video_start;
+            }
+            if (media_options && media_options->video_end >= 0.0) {
+                video_url["video_end"] = media_options->video_end;
+            }
+            part["video_url"] = std::move(video_url);
+        }
+
+        cur_content_parts.push_back(std::move(part));
+    };
 
     auto add_text_file = [&](const std::string & fname) -> bool {
         std::string marker = ctx_cli.load_input_file(fname, false);
@@ -487,7 +563,16 @@ int main(int argc, char ** argv) {
                     break;
                 }
                 console::log("Loaded media from '%s'\n", fname.c_str());
-                cur_msg += marker;
+                add_media_part("image_url", fname, marker);
+            }
+            for (auto & fname : params.video) {
+                std::string marker = ctx_cli.load_input_file(fname, true, &ctx_cli.video_options);
+                if (marker.empty()) {
+                    console::error("file does not exist or cannot be opened: '%s'\n", fname.c_str());
+                    break;
+                }
+                console::log("Loaded video from '%s'\n", fname.c_str());
+                add_media_part("video_url", fname, marker, &ctx_cli.video_options);
             }
             buffer = params.prompt;
             if (buffer.size() > 500) {
@@ -534,20 +619,37 @@ int main(int argc, char ** argv) {
             add_system_prompt();
 
             ctx_cli.input_files.clear();
+            cur_msg.clear();
+            cur_content_parts = json::array();
             console::log("Chat history cleared.\n");
             continue;
         } else if (
                 (string_starts_with(buffer, "/image ") && inf.has_inp_image) ||
-                (string_starts_with(buffer, "/audio ") && inf.has_inp_audio)) {
+                (string_starts_with(buffer, "/audio ") && inf.has_inp_audio) ||
+                (string_starts_with(buffer, "/video ") && inf.has_inp_image)) {
             // just in case (bad copy-paste for example), we strip all trailing/leading spaces
             std::string fname = string_strip(buffer.substr(7));
-            std::string marker = ctx_cli.load_input_file(fname, true);
+            const mtmd_helper_media_options * media_options =
+                string_starts_with(buffer, "/video ") ? &ctx_cli.video_options : nullptr;
+            std::string marker = ctx_cli.load_input_file(fname, true, media_options);
             if (marker.empty()) {
                 console::error("file does not exist or cannot be opened: '%s'\n", fname.c_str());
                 continue;
             }
-            cur_msg += marker;
-            console::log("Loaded media from '%s'\n", fname.c_str());
+            if (string_starts_with(buffer, "/image ")) {
+                add_media_part("image_url", fname, marker);
+            } else if (string_starts_with(buffer, "/video ")) {
+                add_media_part("video_url", fname, marker, media_options);
+            } else {
+                flush_text_part();
+                cur_content_parts.push_back({
+                    {"type", "media_marker"},
+                    {"text", marker}
+                });
+            }
+            console::log("%s '%s'\n",
+                string_starts_with(buffer, "/video ") ? "Loaded video from" : "Loaded media from",
+                fname.c_str());
             continue;
         } else if (string_starts_with(buffer, "/read ")) {
             std::string fname = string_strip(buffer.substr(6));
@@ -613,11 +715,20 @@ int main(int argc, char ** argv) {
 
         // generate response
         if (add_user_msg) {
-            ctx_cli.messages.push_back({
-                {"role",    "user"},
-                {"content", cur_msg}
-            });
-            cur_msg.clear();
+            if (!cur_content_parts.empty()) {
+                flush_text_part();
+                ctx_cli.messages.push_back({
+                    {"role",    "user"},
+                    {"content", cur_content_parts}
+                });
+                cur_content_parts = json::array();
+            } else {
+                ctx_cli.messages.push_back({
+                    {"role",    "user"},
+                    {"content", cur_msg}
+                });
+                cur_msg.clear();
+            }
         }
         result_timings timings;
         std::string assistant_content = ctx_cli.generate_completion(timings);

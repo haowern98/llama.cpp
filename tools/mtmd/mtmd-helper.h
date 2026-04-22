@@ -20,16 +20,36 @@ extern "C" {
 // BREAKING CHANGES are expected.
 //
 
+enum mtmd_helper_media_type {
+    MTMD_HELPER_MEDIA_TYPE_AUTO,
+    MTMD_HELPER_MEDIA_TYPE_IMAGE,
+    MTMD_HELPER_MEDIA_TYPE_VIDEO,
+    MTMD_HELPER_MEDIA_TYPE_AUDIO,
+};
+
+struct mtmd_helper_media_options {
+    enum mtmd_helper_media_type media_type;
+    double video_fps;
+    int32_t video_nframes;
+    int32_t video_min_frames;
+    int32_t video_max_frames;
+    double video_start;
+    double video_end;
+};
+
 // Set callback for all future logging events.
 // If this is not called, or NULL is supplied, everything is output on stderr.
 // Note: this also call mtmd_log_set() internally
 MTMD_API void mtmd_helper_log_set(ggml_log_callback log_callback, void * user_data);
+
+MTMD_API struct mtmd_helper_media_options mtmd_helper_media_options_default(void);
 
 // helper function to construct a mtmd_bitmap from a file
 // it calls mtmd_helper_bitmap_init_from_buf() internally
 // returns nullptr on failure
 // this function is thread-safe
 MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, const char * fname);
+MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_from_file_ex(mtmd_context * ctx, const char * fname, const mtmd_helper_media_options * options);
 
 // helper function to construct a mtmd_bitmap from a buffer containing a file
 // supported formats:
@@ -39,6 +59,7 @@ MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, con
 // returns nullptr on failure
 // this function is thread-safe
 MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len);
+MTMD_API mtmd_bitmap * mtmd_helper_bitmap_init_from_buf_ex(mtmd_context * ctx, const unsigned char * buf, size_t len, const mtmd_helper_media_options * options);
 
 // helper to count the total number of tokens from a list of chunks, useful to keep track of KV cache
 MTMD_API size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks);

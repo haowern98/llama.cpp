@@ -18,6 +18,15 @@ export interface ApiChatMessageContentPart {
 	image_url?: {
 		url: string;
 	};
+	video_url?: {
+		url: string;
+		fps?: number;
+		nframes?: number;
+		min_frames?: number;
+		max_frames?: number;
+		video_start?: number;
+		video_end?: number;
+	};
 	input_audio?: {
 		data: string;
 		format: 'wav' | 'mp3';

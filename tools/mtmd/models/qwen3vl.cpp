@@ -5,7 +5,6 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     GGML_ASSERT(model.position_embeddings != nullptr);
     GGML_ASSERT(model.class_embedding == nullptr);
 
-    const int batch_size       = 1;
     const int n_pos            = n_patches;
     const int num_position_ids = n_pos * 4; // m-rope requires 4 dim per position
 
@@ -13,17 +12,39 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
 
-    ggml_tensor * inp_raw = build_inp_raw();
-    ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+    const bool is_video = img.buf.size() == (size_t) img.nx * img.ny * 6;
+    const int  n_channels = is_video ? 6 : 3;
+
+    ggml_tensor * inp_raw = batch_size > 1
+        ? ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img.nx, img.ny, n_channels, batch_size)
+        : build_inp_raw(n_channels);
+    ggml_set_name(inp_raw, "inp_raw");
+    ggml_set_input(inp_raw);
+    ggml_tensor * inp;
+    if (is_video) {
+        const size_t nb1 = inp_raw->nb[1];
+        const size_t nb2 = inp_raw->nb[2];
+        const size_t nb3 = batch_size > 1 ? inp_raw->nb[3] : 0;
+        ggml_tensor * inp_even = batch_size > 1
+            ? ggml_view_4d(ctx0, inp_raw, img.nx, img.ny, 3, batch_size, nb1, nb2, nb3, 0)
+            : ggml_view_3d(ctx0, inp_raw, img.nx, img.ny, 3, nb1, nb2, 0);
+        ggml_tensor * inp_odd  = batch_size > 1
+            ? ggml_view_4d(ctx0, inp_raw, img.nx, img.ny, 3, batch_size, nb1, nb2, nb3, nb2 * 3)
+            : ggml_view_3d(ctx0, inp_raw, img.nx, img.ny, 3, nb1, nb2, nb2 * 3);
+        inp = ggml_add(ctx0,
+            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_even, patch_size, patch_size, 0, 0, 1, 1),
+            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_odd,  patch_size, patch_size, 0, 0, 1, 1));
+    } else {
+        inp = ggml_add(ctx0,
+            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
+            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));
+    }
 
     GGML_ASSERT(img.nx % (patch_size * 2) == 0);
     GGML_ASSERT(img.ny % (patch_size * 2) == 0);
 
-    // second conv dimension
+    // spatial merge
     {
-        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
-        inp = ggml_add(ctx0, inp, inp_1);
-
         inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
         inp = ggml_cont_4d(
             ctx0, inp,
@@ -39,7 +60,11 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
     // add patch bias
     if (model.patch_bias != nullptr) {
-        inp = ggml_add(ctx0, inp, model.patch_bias);
+        ggml_tensor * patch_bias = model.patch_bias;
+        if (batch_size > 1) {
+            patch_bias = ggml_repeat(ctx0, patch_bias, inp);
+        }
+        inp = ggml_add(ctx0, inp, patch_bias);
         cb(inp, "patch_bias", -1);
     }
 
@@ -47,14 +72,17 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     ggml_tensor * learned_pos_embd = resize_position_embeddings();
     learned_pos_embd = ggml_cont_4d(
         ctx0, learned_pos_embd,
-        n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+        n_embd * 2, n_patches_x / 2, n_patches_y, 1);
     learned_pos_embd = ggml_reshape_4d(
         ctx0, learned_pos_embd,
-        n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
+        n_embd * 2, n_patches_x / 2, 2, n_patches_y / 2);
     learned_pos_embd = ggml_permute(ctx0, learned_pos_embd, 0, 2, 1, 3);
     learned_pos_embd = ggml_cont_3d(
         ctx0, learned_pos_embd,
-        n_embd, n_patches_x * n_patches_y, batch_size);
+        n_embd, n_patches_x * n_patches_y, 1);
+    if (batch_size > 1) {
+        learned_pos_embd = ggml_repeat(ctx0, learned_pos_embd, inp);
+    }
     inp = ggml_add(ctx0, inp, learned_pos_embd);
     cb(inp, "inp_pos_emb", -1);
 
@@ -88,17 +116,35 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
             cur = build_mm(layer.qkv_w, cur);
             cur = ggml_add(ctx0, cur, layer.qkv_b);
 
-            ggml_tensor * Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+            ggml_tensor * Qcur = batch_size > 1
+                ? ggml_view_4d(ctx0, cur, d_head, n_head, n_pos, batch_size,
+                    /* nb1    */ ggml_row_size(cur->type, d_head),
+                    /* nb2    */ cur->nb[1],
+                    /* nb3    */ cur->nb[2],
+                    /* offset */ 0)
+                : ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
                     /* nb1    */ ggml_row_size(cur->type, d_head),
                     /* nb2    */ cur->nb[1],
                     /* offset */ 0);
 
-            ggml_tensor * Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+            ggml_tensor * Kcur = batch_size > 1
+                ? ggml_view_4d(ctx0, cur, d_head, n_head, n_pos, batch_size,
+                    /* nb1    */ ggml_row_size(cur->type, d_head),
+                    /* nb2    */ cur->nb[1],
+                    /* nb3    */ cur->nb[2],
+                    /* offset */ ggml_row_size(cur->type, n_embd))
+                : ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
                     /* nb1    */ ggml_row_size(cur->type, d_head),
                     /* nb2    */ cur->nb[1],
                     /* offset */ ggml_row_size(cur->type, n_embd));
 
-            ggml_tensor * Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+            ggml_tensor * Vcur = batch_size > 1
+                ? ggml_view_4d(ctx0, cur, d_head, n_head, n_pos, batch_size,
+                    /* nb1    */ ggml_row_size(cur->type, d_head),
+                    /* nb2    */ cur->nb[1],
+                    /* nb3    */ cur->nb[2],
+                    /* offset */ ggml_row_size(cur->type, 2 * n_embd))
+                : ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
                     /* nb1    */ ggml_row_size(cur->type, d_head),
                     /* nb2    */ cur->nb[1],
                     /* offset */ ggml_row_size(cur->type, 2 * n_embd));
@@ -120,6 +166,9 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
             cur = build_attn(layer.o_w, layer.o_b,
                 Qcur, Kcur, Vcur, nullptr, kq_scale, il);
+            if (batch_size > 1) {
+                cur = ggml_reshape_3d(ctx0, cur, n_embd, n_pos, batch_size);
+            }
             cb(cur, "attn_out", il);
         }
 

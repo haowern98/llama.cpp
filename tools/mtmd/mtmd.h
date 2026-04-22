@@ -53,6 +53,7 @@ extern "C" {
 enum mtmd_input_chunk_type {
     MTMD_INPUT_CHUNK_TYPE_TEXT,
     MTMD_INPUT_CHUNK_TYPE_IMAGE,
+    MTMD_INPUT_CHUNK_TYPE_VIDEO,
     MTMD_INPUT_CHUNK_TYPE_AUDIO,
 };
 
@@ -132,16 +133,22 @@ MTMD_API int mtmd_get_audio_sample_rate(mtmd_context * ctx);
 // if bitmap is image:
 //     length of data must be nx * ny * 3
 //     the data is in RGBRGBRGB... format
+// if bitmap is video:
+//     length of data must be nx * ny * 3 * n_frames
+//     the data is a sequence of RGB frames
 // if bitmap is audio:
 //     length of data must be n_samples * sizeof(float)
 //     the data is in float format (PCM F32)
 MTMD_API mtmd_bitmap *         mtmd_bitmap_init           (uint32_t nx, uint32_t ny, const unsigned char * data);
+MTMD_API mtmd_bitmap *         mtmd_bitmap_init_from_video(uint32_t nx, uint32_t ny, uint32_t n_frames, const unsigned char * data);
 MTMD_API mtmd_bitmap *         mtmd_bitmap_init_from_audio(size_t n_samples,         const float         * data);
 MTMD_API uint32_t              mtmd_bitmap_get_nx     (const mtmd_bitmap * bitmap);
 MTMD_API uint32_t              mtmd_bitmap_get_ny     (const mtmd_bitmap * bitmap);
 MTMD_API const unsigned char * mtmd_bitmap_get_data   (const mtmd_bitmap * bitmap);
 MTMD_API size_t                mtmd_bitmap_get_n_bytes(const mtmd_bitmap * bitmap);
 MTMD_API bool                  mtmd_bitmap_is_audio   (const mtmd_bitmap * bitmap);
+MTMD_API bool                  mtmd_bitmap_is_video   (const mtmd_bitmap * bitmap);
+MTMD_API uint32_t              mtmd_bitmap_get_n_frames(const mtmd_bitmap * bitmap);
 MTMD_API void                  mtmd_bitmap_free       (mtmd_bitmap * bitmap);
 // bitmap ID is optional, but useful for KV cache tracking
 // these getters/setters are dedicated functions, so you can for example calculate the hash of the image based on mtmd_bitmap_get_data()
@@ -183,6 +190,12 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 // the instance will be constructed via mtmd_tokenize()
 // it will be freed along with mtmd_input_chunk
 MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens); // TODO: deprecate
+MTMD_API size_t       mtmd_image_tokens_get_nt      (const mtmd_image_tokens * image_tokens);
+MTMD_API size_t       mtmd_image_tokens_get_video_slice_index(const mtmd_image_tokens * image_tokens);
+MTMD_API size_t       mtmd_image_tokens_get_video_slice_count(const mtmd_image_tokens * image_tokens);
+MTMD_API int32_t      mtmd_image_tokens_get_video_frame_start(const mtmd_image_tokens * image_tokens);
+MTMD_API int32_t      mtmd_image_tokens_get_video_frame_end  (const mtmd_image_tokens * image_tokens);
+MTMD_API double       mtmd_image_tokens_get_video_timestamp_seconds(const mtmd_image_tokens * image_tokens);
 MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
 // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
@@ -289,9 +302,14 @@ struct bitmap {
     bitmap(uint32_t nx, uint32_t ny, const unsigned char * data) {
         ptr.reset(mtmd_bitmap_init(nx, ny, data));
     }
+    bitmap(uint32_t nx, uint32_t ny, uint32_t n_frames, const unsigned char * data) {
+        ptr.reset(mtmd_bitmap_init_from_video(nx, ny, n_frames, data));
+    }
     ~bitmap() = default;
     uint32_t nx() const { return mtmd_bitmap_get_nx(ptr.get()); }
     uint32_t ny() const { return mtmd_bitmap_get_ny(ptr.get()); }
+    uint32_t n_frames() const { return mtmd_bitmap_get_n_frames(ptr.get()); }
+    bool is_video() const { return mtmd_bitmap_is_video(ptr.get()); }
     const unsigned char * data() const { return mtmd_bitmap_get_data(ptr.get()); }
     size_t n_bytes() const { return mtmd_bitmap_get_n_bytes(ptr.get()); }
     std::string id() const { return mtmd_bitmap_get_id(ptr.get()); }

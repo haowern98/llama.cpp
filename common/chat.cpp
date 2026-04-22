@@ -70,6 +70,11 @@ static bool has_content_or_tool_calls(const common_chat_msg & msg) {
     return !msg.content.empty() || !msg.tool_calls.empty();
 }
 
+static bool is_media_like_content_part(const common_chat_msg_content_part & part) {
+    return part.type == "media_marker" || part.type == "image_url" || part.type == "video_url" ||
+           part.type == "input_audio";
+}
+
 json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!content.empty() && !content_parts.empty()) {
         throw std::runtime_error("Cannot specify both content and content_parts");
@@ -89,7 +94,7 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
                 if (part.type == "text") {
                     add_new_line = !last_was_media_marker && !text.empty();
                     last_was_media_marker = false;
-                } else if (part.type == "media_marker") {
+                } else if (is_media_like_content_part(part)) {
                     add_new_line = false;
                     last_was_media_marker = true;
                 } else {
@@ -107,10 +112,54 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
         } else {
             auto & parts = jmsg["content"] = json::array();
             for (const auto & part : content_parts) {
-                parts.push_back({
+                json jpart = {
                     {"type", part.type},
-                    {"text", part.text},
-                });
+                };
+                if (!part.text.empty()) {
+                    jpart["text"] = part.text;
+                }
+                if (part.type == "image_url") {
+                    jpart["image"] = part.url;
+                    jpart["image_url"] = {
+                        {"url", part.url},
+                    };
+                } else if (part.type == "video_url") {
+                    json video_url = {
+                        {"url", part.url},
+                    };
+                    jpart["video"] = part.url;
+                    if (part.video_fps > 0.0) {
+                        video_url["fps"] = part.video_fps;
+                    }
+                    if (part.video_nframes > 0) {
+                        video_url["nframes"] = part.video_nframes;
+                    }
+                    if (part.video_min_frames > 0) {
+                        video_url["min_frames"] = part.video_min_frames;
+                    }
+                    if (part.video_max_frames > 0) {
+                        video_url["max_frames"] = part.video_max_frames;
+                    }
+                    if (part.video_start >= 0.0) {
+                        video_url["video_start"] = part.video_start;
+                    }
+                    if (part.video_end >= 0.0) {
+                        video_url["video_end"] = part.video_end;
+                    }
+                    jpart["video_url"] = std::move(video_url);
+                } else if (part.type == "input_audio") {
+                    json input_audio = json::object();
+                    if (!part.input_audio_data.empty()) {
+                        input_audio["data"] = part.input_audio_data;
+                    }
+                    if (!part.input_audio_format.empty()) {
+                        input_audio["format"] = part.input_audio_format;
+                    }
+                    jpart["input_audio"] = std::move(input_audio);
+                } else if (!part.text.empty()) {
+                    jpart["text"] = part.text;
+                }
+                parts.push_back(std::move(jpart));
             }
         }
     } else {
@@ -287,12 +336,31 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                             throw std::invalid_argument("Missing content part type: " + part.dump());
                         }
                         const auto & type = part.at("type");
-                        if (type != "text" && type != "media_marker") {
+                        if (type != "text" && type != "media_marker" && type != "image_url" &&
+                            type != "video_url" && type != "input_audio") {
                             throw std::invalid_argument("Unsupported content part type: " + type.dump());
                         }
                         common_chat_msg_content_part msg_part;
                         msg_part.type = type;
-                        msg_part.text = part.at("text");
+                        msg_part.text = part.value("text", "");
+                        if (msg_part.type == "image_url") {
+                            msg_part.url = part.at("image_url").value("url", "");
+                        } else if (msg_part.type == "video_url") {
+                            const auto & video_url = part.at("video_url");
+                            msg_part.url = video_url.value("url", "");
+                            msg_part.video_fps = video_url.value("fps", -1.0);
+                            msg_part.video_nframes = video_url.value("nframes", -1);
+                            msg_part.video_min_frames = video_url.value("min_frames", -1);
+                            msg_part.video_max_frames = video_url.value("max_frames", -1);
+                            msg_part.video_start = video_url.value("video_start", -1.0);
+                            msg_part.video_end = video_url.value("video_end", -1.0);
+                        } else if (msg_part.type == "input_audio") {
+                            const auto & input_audio = part.at("input_audio");
+                            msg_part.input_audio_data = input_audio.value("data", "");
+                            msg_part.input_audio_format = input_audio.value("format", "");
+                        } else if (part.contains("text")) {
+                            msg_part.text = part.at("text");
+                        }
                         msg.content_parts.push_back(msg_part);
                     }
                 } else if (!content.is_null()) {
@@ -364,13 +432,29 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
 
     bool only_string_accepted =  c.supports_string_content && !c.supports_typed_content;
     bool only_typed_accepted  = !c.supports_string_content &&  c.supports_typed_content;
+    bool has_non_text_typed_content = false;
+
+    for (const auto & msg : msgs) {
+        for (const auto & part : msg.content_parts) {
+            if (part.type != "text" && part.type != "media_marker") {
+                has_non_text_typed_content = true;
+                break;
+            }
+        }
+        if (has_non_text_typed_content) {
+            break;
+        }
+    }
 
     json messages = json::array();
     for (const auto & msg : msgs) {
-        if (only_string_accepted) {
+        if (only_string_accepted && !has_non_text_typed_content) {
             json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ true);
             messages.push_back(jmsg);
-        } else if (only_typed_accepted) {
+        } else if (only_typed_accepted || has_non_text_typed_content) {
+            if (only_string_accepted && has_non_text_typed_content) {
+                LOG_WRN("%s: template caps reported string-only content, but preserving typed media content for multimodal rendering.\n", __func__);
+            }
             json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
             if (jmsg.at("content").is_string()) {
                 jmsg["content"] = json::array({
@@ -2249,7 +2333,7 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
     for (const auto & msg : inputs.messages) {
         auto content = msg.content;
         for (const auto & part : msg.content_parts) {
-            if (part.type != "text" && part.type != "media_marker") {
+            if (part.type != "text" && !is_media_like_content_part(part)) {
                 LOG_WRN("Ignoring non-text content part: %s\n", part.type.c_str());
                 continue;
             }
