@@ -32,6 +32,7 @@ using raw_buffer = std::vector<uint8_t>;
 
 struct server_media_input {
     raw_buffer data;
+    std::string path;
     mtmd_helper_media_options options = mtmd_helper_media_options_default();
 };
 

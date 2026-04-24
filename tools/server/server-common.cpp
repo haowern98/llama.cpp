@@ -12,6 +12,7 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <filesystem>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -719,7 +720,21 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
 }
 
 static std::string hash_media_input(const server_media_input & media) {
-    std::string hash = fnv_hash(media.data.data(), media.data.size());
+    std::string hash;
+    if (!media.path.empty()) {
+        hash = "path:" + media.path;
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(media.path, ec);
+        if (!ec) {
+            hash += ":" + std::to_string(size);
+        }
+        const auto write_time = std::filesystem::last_write_time(media.path, ec);
+        if (!ec) {
+            hash += ":" + std::to_string(write_time.time_since_epoch().count());
+        }
+    } else {
+        hash = fnv_hash(media.data.data(), media.data.size());
+    }
     hash += ":" + std::to_string((int) media.options.media_type);
     hash += ":" + std::to_string(media.options.video_nframes);
     hash += ":" + std::to_string(media.options.video_min_frames);
@@ -733,11 +748,16 @@ static std::string hash_media_input(const server_media_input & media) {
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<server_media_input> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf_ex(
-            mctx,
-            file.data.data(),
-            file.data.size(),
-            &file.options));
+        mtmd::bitmap bmp(!file.path.empty()
+            ? mtmd_helper_bitmap_init_from_file_ex(
+                mctx,
+                file.path.c_str(),
+                &file.options)
+            : mtmd_helper_bitmap_init_from_buf_ex(
+                mctx,
+                file.data.data(),
+                file.data.size(),
+                &file.options));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load media file");
         }
@@ -907,13 +927,18 @@ static void handle_media(
             throw std::invalid_argument("file path is not allowed: " + file_path);
         }
         SRV_INF("loading media from local file '%s'\n", (media_path + file_path).c_str());
-        std::ifstream file(media_path + file_path, std::ios::binary);
+        const std::string full_path = media_path + file_path;
+        std::ifstream file(full_path, std::ios::binary);
         if (!file) {
             throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
         }
         server_media_input media;
         media.options = options;
-        media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        if (options.media_type == MTMD_HELPER_MEDIA_TYPE_VIDEO) {
+            media.path = full_path;
+        } else {
+            media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        }
         out_files.push_back(std::move(media));
 
     } else {

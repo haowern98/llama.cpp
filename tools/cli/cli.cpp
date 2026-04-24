@@ -202,7 +202,11 @@ struct cli_context {
         if (is_media) {
             server_media_input media;
             media.options = media_options ? *media_options : mtmd_helper_media_options_default();
-            media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            if (media.options.media_type == MTMD_HELPER_MEDIA_TYPE_VIDEO) {
+                media.path = fname;
+            } else {
+                media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            }
             input_files.push_back(std::move(media));
             return get_media_marker();
         } else {
