@@ -684,6 +684,10 @@ struct mtmd_tokenizer {
                 return 2;
             }
 
+            if (bitmap->nt > 1) {
+                return add_seq_image(bitmap);
+            }
+
             if (!ctx->img_beg.empty()) {
                 add_text(ctx->img_beg, true); // add image begin token
             }
@@ -890,6 +894,13 @@ struct mtmd_tokenizer {
 
         const uint32_t n_frames = bitmap->nt;
         const size_t   frame_bytes = (size_t)bitmap->nx * bitmap->ny * 3;
+        GGML_ASSERT(bitmap->nx > 0 && bitmap->ny > 0);
+        GGML_ASSERT(bitmap->data.size() == frame_bytes * n_frames);
+        GGML_ASSERT(ctx->image_preproc != nullptr);
+
+        if (!ctx->img_beg.empty()) {
+            add_text(ctx->img_beg, true); // add image begin token
+        }
 
         // preprocess each frame individually
         clip_image_f32_batch all_frames;
