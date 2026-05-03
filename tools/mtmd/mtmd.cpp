@@ -893,6 +893,7 @@ struct mtmd_tokenizer {
         }
 
         const uint32_t n_frames = bitmap->nt;
+        const uint32_t seq_group_size = 2; // current seq-capable vision graphs consume paired frames
         const size_t   frame_bytes = (size_t)bitmap->nx * bitmap->ny * 3;
         GGML_ASSERT(bitmap->nx > 0 && bitmap->ny > 0);
         GGML_ASSERT(bitmap->data.size() == frame_bytes * n_frames);
@@ -902,51 +903,52 @@ struct mtmd_tokenizer {
             add_text(ctx->img_beg, true); // add image begin token
         }
 
-        // preprocess each frame individually
-        clip_image_f32_batch all_frames;
-        all_frames.is_seq = true;
-        all_frames.grid_x = 0; // currently, we don't support tiling for video input
-        all_frames.grid_y = 0; // currently, we don't support tiling for video input
+        for (uint32_t f = 0; f < n_frames; f += seq_group_size) {
+            clip_image_f32_batch frames;
+            frames.is_seq = true;
+            frames.grid_x = 0; // currently, we don't support tiling for sequence input
+            frames.grid_y = 0; // currently, we don't support tiling for sequence input
 
-        for (uint32_t f = 0; f < n_frames; f++) {
-            clip_image_u8_ptr img_u8(clip_image_u8_init());
-            img_u8->nx = bitmap->nx;
-            img_u8->ny = bitmap->ny;
-            img_u8->buf.resize(frame_bytes);
-            std::memcpy(img_u8->buf.data(), bitmap->data.data() + f * frame_bytes, frame_bytes);
+            for (uint32_t i = 0; i < seq_group_size; ++i) {
+                clip_image_u8_ptr img_u8(clip_image_u8_init());
+                img_u8->nx = bitmap->nx;
+                img_u8->ny = bitmap->ny;
+                img_u8->buf.resize(frame_bytes);
+                std::memcpy(img_u8->buf.data(), bitmap->data.data() + (f + i) * frame_bytes, frame_bytes);
 
-            clip_image_f32_batch frame_batch;
-            bool ok = ctx->image_preproc->preprocess(*img_u8, frame_batch);
-            if (!ok) {
-                LOG_ERR("Unable to preprocess image\n");
-                return 2;
+                clip_image_f32_batch frame_batch;
+                bool ok = ctx->image_preproc->preprocess(*img_u8, frame_batch);
+                if (!ok) {
+                    LOG_ERR("Unable to preprocess image\n");
+                    return 2;
+                }
+                GGML_ASSERT(frame_batch.entries.size() == 1);
+                frames.entries.push_back(std::move(frame_batch.entries[0]));
             }
-            GGML_ASSERT(frame_batch.entries.size() == 1);
-            all_frames.entries.push_back(std::move(frame_batch.entries[0]));
+
+            mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+            if (mtmd_decode_use_mrope(ctx)) {
+                // for Qwen-VL style models, paired sequence chunks carry 3D M-RoPE positions
+                image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, frames.entries[0].get());
+                image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, frames.entries[0].get());
+                image_tokens->use_mrope_pos = true;
+            } else {
+                GGML_ASSERT(false && "not supported");
+            }
+            image_tokens->batch_f32 = std::move(frames);
+            image_tokens->id = bitmap->id; // optional
+
+            LOG_DBG("seq_image: frames=%u-%u, nx=%u, ny=%u, n_tokens=%u\n",
+                    f, f + seq_group_size - 1, image_tokens->nx, image_tokens->ny, image_tokens->n_tokens());
+
+            mtmd_input_chunk chunk{
+                MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                {}, // text tokens
+                std::move(image_tokens),
+                nullptr, // audio tokens
+            };
+            cur.entries.emplace_back(std::move(chunk));
         }
-
-        mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
-        if (mtmd_decode_use_mrope(ctx)) {
-            // for Qwen2VL, we need this information for M-RoPE decoding positions
-            image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, all_frames.entries[0].get());
-            image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, all_frames.entries[0].get());
-            image_tokens->use_mrope_pos = true;
-        } else {
-            GGML_ASSERT(false && "not supported");
-        }
-        image_tokens->batch_f32 = std::move(all_frames);
-        image_tokens->id = bitmap->id; // optional
-
-        LOG_DBG("seq_image: nt=%u, nx=%u, ny=%u, n_tokens=%u\n",
-                bitmap->nt, image_tokens->nx, image_tokens->ny, image_tokens->n_tokens());
-
-        mtmd_input_chunk chunk{
-            MTMD_INPUT_CHUNK_TYPE_IMAGE,
-            {}, // text tokens
-            std::move(image_tokens),
-            nullptr, // audio tokens
-        };
-        cur.entries.emplace_back(std::move(chunk));
 
         if (!ctx->img_end.empty()) {
             add_text(ctx->img_end, true);
